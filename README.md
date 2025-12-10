@@ -225,6 +225,51 @@ python sync_data_copy.py > sync_log.txt 2>&1
 | Source (Prod) | `az-zan-sws-prod-01.sql.azuresynapse.net` | `FB_DW` |
 | Target (Dev) | `synapse-fbnova-dev.sql.azuresynapse.net` | `sqlpoolfbnovadev` |
 
+## Deployment
+
+### Azure Container Instances (Recommended for Production)
+
+For scheduled/automated runs, deploy as a container:
+
+```bash
+# PowerShell
+.\deploy.ps1
+
+# Bash
+./deploy.sh
+```
+
+See deployment files:
+- `Dockerfile` - Container image definition
+- `deploy.ps1` / `deploy.sh` - Deployment scripts
+- `logic-app-schedule.json` - Scheduling ARM template
+- `env.example` - Environment variable template
+
+### Automated Authentication
+
+For production deployments, use Service Principal authentication instead of interactive:
+
+```env
+AZURE_CLIENT_ID=your-service-principal-id
+AZURE_CLIENT_SECRET=your-service-principal-secret
+```
+
+Use `sync_data_copy_automated.py` for production runs.
+
+## Table Analysis
+
+See `TABLE_ANALYSIS.md` for:
+- Complete table inventory with row counts
+- Recommended sync phases
+- Large table handling strategies
+- Performance estimates
+
+## Related Documentation
+
+- Schema reference: `famous-brands-labs/src/database/schema/`
+- Report inventory: `famous-brands-labs/src/reports/all_reports.md`
+- Nova sync docs: `famous-brands-labs/.docs/general/nova-sync-tool.md`
+
 ## License
 
 Internal use only – FB Nova project.

@@ -1,12 +1,15 @@
 """
-FB Nova - Data Sync using COPY command (FAST)
+FB Nova - Data Sync using COPY command (AUTOMATED VERSION)
 Exports to CSV → Blob Storage → COPY INTO Synapse
+
+This version uses Service Principal authentication for automated/scheduled runs.
 """
 
 import pyodbc
 import pandas as pd
 import numpy as np
 import os
+import sys
 from datetime import datetime
 from azure.storage.blob import BlobServiceClient
 
@@ -14,7 +17,7 @@ from azure.storage.blob import BlobServiceClient
 # CONFIGURATION
 # =============================================================================
 
-# Load .env
+# Load .env file if exists (for local development)
 if os.path.exists(".env"):
     with open(".env") as f:
         for line in f:
@@ -24,55 +27,112 @@ if os.path.exists(".env"):
                 os.environ[key.strip()] = value.strip()
 
 # Source (Prod)
-SOURCE_SERVER = "az-zan-sws-prod-01.sql.azuresynapse.net"
-SOURCE_DATABASE = "FB_DW"
+SOURCE_SERVER = os.getenv("SOURCE_SERVER", "az-zan-sws-prod-01.sql.azuresynapse.net")
+SOURCE_DATABASE = os.getenv("SOURCE_DATABASE", "FB_DW")
 
 # Target (Dev)
-TARGET_SERVER = "synapse-fbnova-dev.sql.azuresynapse.net"
-TARGET_DATABASE = "sqlpoolfbnovadev"
+TARGET_SERVER = os.getenv("TARGET_SERVER", "synapse-fbnova-dev.sql.azuresynapse.net")
+TARGET_DATABASE = os.getenv("TARGET_DATABASE", "sqlpoolfbnovadev")
 
 # Azure Storage
 STORAGE_CONNECTION_STRING = os.getenv("STORAGE_CONNECTION_STRING")
-STORAGE_ACCOUNT = "stsynfbnovadev"
-CONTAINER_NAME = "synapsedata"
+STORAGE_ACCOUNT = os.getenv("STORAGE_ACCOUNT", "stsynfbnovadev")
+STORAGE_KEY = os.getenv("STORAGE_KEY")
+CONTAINER_NAME = os.getenv("CONTAINER_NAME", "synapsedata")
 
-# Auth
+# Service Principal Authentication (for automated runs)
+AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
+AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
+AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
+
+# Legacy interactive auth (for local testing only)
 USERNAME = os.getenv("USERNAME")
+
+# =============================================================================
+# AUTHENTICATION MODE
+# =============================================================================
+
+def get_auth_mode():
+    """Determine authentication mode based on available credentials"""
+    if AZURE_CLIENT_ID and AZURE_CLIENT_SECRET:
+        return "ServicePrincipal"
+    elif USERNAME:
+        return "Interactive"
+    else:
+        return None
 
 # =============================================================================
 # CONNECTIONS
 # =============================================================================
 
 def connect_source():
-    """Connect to source using Azure AD Interactive"""
-    if not USERNAME:
-        raise ValueError("USERNAME not set in .env file")
+    """Connect to source database"""
+    auth_mode = get_auth_mode()
     print(f"  Connecting to source: {SOURCE_SERVER}...")
-    conn_string = (
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-        f"SERVER={SOURCE_SERVER};"
-        f"DATABASE={SOURCE_DATABASE};"
-        f"UID={USERNAME};"
-        f"Authentication=ActiveDirectoryInteractive;"
-        f"Encrypt=yes;"
-    )
+    print(f"  Authentication mode: {auth_mode}")
+    
+    if auth_mode == "ServicePrincipal":
+        conn_string = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={SOURCE_SERVER};"
+            f"DATABASE={SOURCE_DATABASE};"
+            f"UID={AZURE_CLIENT_ID};"
+            f"PWD={AZURE_CLIENT_SECRET};"
+            f"Authentication=ActiveDirectoryServicePrincipal;"
+            f"Encrypt=yes;"
+        )
+    elif auth_mode == "Interactive":
+        conn_string = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={SOURCE_SERVER};"
+            f"DATABASE={SOURCE_DATABASE};"
+            f"UID={USERNAME};"
+            f"Authentication=ActiveDirectoryInteractive;"
+            f"Encrypt=yes;"
+        )
+    else:
+        raise ValueError(
+            "No authentication credentials found. "
+            "Set either AZURE_CLIENT_ID + AZURE_CLIENT_SECRET (for automated runs) "
+            "or USERNAME (for interactive testing)"
+        )
+    
     conn = pyodbc.connect(conn_string)
     print(f"  ✓ Source connected")
     return conn
 
 def connect_target():
-    """Connect to target using Azure AD Interactive"""
-    if not USERNAME:
-        raise ValueError("USERNAME not set in .env file")
+    """Connect to target database"""
+    auth_mode = get_auth_mode()
     print(f"  Connecting to target: {TARGET_SERVER}...")
-    conn_string = (
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-        f"SERVER={TARGET_SERVER};"
-        f"DATABASE={TARGET_DATABASE};"
-        f"UID={USERNAME};"
-        f"Authentication=ActiveDirectoryInteractive;"
-        f"Encrypt=yes;"
-    )
+    print(f"  Authentication mode: {auth_mode}")
+    
+    if auth_mode == "ServicePrincipal":
+        conn_string = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={TARGET_SERVER};"
+            f"DATABASE={TARGET_DATABASE};"
+            f"UID={AZURE_CLIENT_ID};"
+            f"PWD={AZURE_CLIENT_SECRET};"
+            f"Authentication=ActiveDirectoryServicePrincipal;"
+            f"Encrypt=yes;"
+        )
+    elif auth_mode == "Interactive":
+        conn_string = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={TARGET_SERVER};"
+            f"DATABASE={TARGET_DATABASE};"
+            f"UID={USERNAME};"
+            f"Authentication=ActiveDirectoryInteractive;"
+            f"Encrypt=yes;"
+        )
+    else:
+        raise ValueError(
+            "No authentication credentials found. "
+            "Set either AZURE_CLIENT_ID + AZURE_CLIENT_SECRET (for automated runs) "
+            "or USERNAME (for interactive testing)"
+        )
+    
     conn = pyodbc.connect(conn_string, autocommit=True)
     print(f"  ✓ Target connected")
     return conn
@@ -80,7 +140,7 @@ def connect_target():
 def get_blob_client():
     """Get blob service client"""
     if not STORAGE_CONNECTION_STRING:
-        raise ValueError("STORAGE_CONNECTION_STRING not set in .env file")
+        raise ValueError("STORAGE_CONNECTION_STRING not set in environment")
     return BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
 
 # =============================================================================
@@ -90,7 +150,24 @@ def get_blob_client():
 def read_config():
     """Read config file, return enabled tables only"""
     print("Reading config file...")
-    df = pd.read_excel("config file.xlsx")
+    
+    # Check for config file in multiple locations
+    config_paths = [
+        "config file.xlsx",
+        "/app/config file.xlsx",
+        os.path.join(os.path.dirname(__file__), "config file.xlsx")
+    ]
+    
+    config_path = None
+    for path in config_paths:
+        if os.path.exists(path):
+            config_path = path
+            break
+    
+    if not config_path:
+        raise FileNotFoundError(f"Config file not found. Searched: {config_paths}")
+    
+    df = pd.read_excel(config_path)
     
     # Strip whitespace from column names (handles "Enabled " with trailing space)
     df.columns = df.columns.str.strip()
@@ -323,7 +400,7 @@ def copy_into_target(target_conn, config, table_name, chunk_count):
             FILE_TYPE = 'CSV',
             FIELDTERMINATOR = '|',
             FIRSTROW = {2 if chunk_num == 1 else 1},
-            CREDENTIAL = (IDENTITY = 'Storage Account Key', SECRET = '{os.getenv("STORAGE_KEY")}')
+            CREDENTIAL = (IDENTITY = 'Storage Account Key', SECRET = '{STORAGE_KEY}')
         )
         """
         
@@ -386,31 +463,62 @@ def process_table(source_conn, target_conn, config):
     
     return {'table': config['source_table'], 'rows': rows, 'time': elapsed, 'status': status, 'error': error}
 
+def validate_environment():
+    """Validate all required environment variables are set"""
+    errors = []
+    
+    if not STORAGE_CONNECTION_STRING:
+        errors.append("STORAGE_CONNECTION_STRING not set")
+    if not STORAGE_KEY:
+        errors.append("STORAGE_KEY not set")
+    
+    auth_mode = get_auth_mode()
+    if not auth_mode:
+        errors.append("No authentication configured. Set AZURE_CLIENT_ID + AZURE_CLIENT_SECRET or USERNAME")
+    
+    if errors:
+        print("=" * 60)
+        print("CONFIGURATION ERRORS")
+        print("=" * 60)
+        for err in errors:
+            print(f"  ✗ {err}")
+        print("\nPlease set the required environment variables and try again.")
+        print("See .env.example for reference.")
+        return False
+    
+    return True
+
 def main():
     print("=" * 60)
     print("FB NOVA - DATA SYNC (COPY method)")
     print(f"Started: {datetime.now()}")
+    print(f"Authentication: {get_auth_mode()}")
     print("=" * 60)
     
-    # Check required environment variables
-    if not STORAGE_CONNECTION_STRING:
-        print("ERROR: STORAGE_CONNECTION_STRING not set in .env")
-        return
-    if not os.getenv("STORAGE_KEY"):
-        print("ERROR: STORAGE_KEY not set in .env")
-        return
-    if not USERNAME:
-        print("ERROR: USERNAME not set in .env")
-        return
+    # Validate environment
+    if not validate_environment():
+        sys.exit(1)
     
     # Read config
     print("\nSTEP 1: READ CONFIG")
-    tables = read_config()
+    try:
+        tables = read_config()
+    except Exception as e:
+        print(f"  ✗ ERROR reading config: {e}")
+        sys.exit(1)
+    
+    if len(tables) == 0:
+        print("  ⚠ No tables enabled in config file. Update 'Enabled' column to 'Y' for tables to sync.")
+        sys.exit(0)
     
     # Connect
     print("\nSTEP 2: CONNECT")
-    source_conn = connect_source()
-    target_conn = connect_target()
+    try:
+        source_conn = connect_source()
+        target_conn = connect_target()
+    except Exception as e:
+        print(f"  ✗ CONNECTION ERROR: {e}")
+        sys.exit(1)
     
     # Process tables
     print("\nSTEP 3: PROCESS TABLES")
@@ -444,6 +552,10 @@ def main():
     target_conn.close()
     
     print(f"\nCompleted: {datetime.now()}")
+    
+    # Exit with error code if any tables failed
+    if failed > 0:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

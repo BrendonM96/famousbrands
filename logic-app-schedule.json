@@ -1,0 +1,189 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "logicAppName": {
+            "type": "string",
+            "defaultValue": "la-fbnova-scheduler",
+            "metadata": {
+                "description": "Name of the Logic App"
+            }
+        },
+        "location": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]",
+            "metadata": {
+                "description": "Location for the Logic App"
+            }
+        },
+        "containerGroupName": {
+            "type": "string",
+            "defaultValue": "aci-fbnova-sync",
+            "metadata": {
+                "description": "Name of the Container Instance to trigger"
+            }
+        },
+        "containerResourceGroup": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().name]",
+            "metadata": {
+                "description": "Resource group containing the Container Instance"
+            }
+        },
+        "scheduleHour": {
+            "type": "int",
+            "defaultValue": 2,
+            "metadata": {
+                "description": "Hour (0-23) to run the sync job"
+            }
+        },
+        "scheduleMinute": {
+            "type": "int",
+            "defaultValue": 0,
+            "metadata": {
+                "description": "Minute (0-59) to run the sync job"
+            }
+        },
+        "timeZone": {
+            "type": "string",
+            "defaultValue": "South Africa Standard Time",
+            "metadata": {
+                "description": "Time zone for the schedule"
+            }
+        }
+    },
+    "variables": {
+        "containerGroupId": "[resourceId(parameters('containerResourceGroup'), 'Microsoft.ContainerInstance/containerGroups', parameters('containerGroupName'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2019-05-01",
+            "name": "[parameters('logicAppName')]",
+            "location": "[parameters('location')]",
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {},
+                    "triggers": {
+                        "Recurrence": {
+                            "type": "Recurrence",
+                            "recurrence": {
+                                "frequency": "Day",
+                                "interval": 1,
+                                "schedule": {
+                                    "hours": ["[parameters('scheduleHour')]"],
+                                    "minutes": ["[parameters('scheduleMinute')]"]
+                                },
+                                "timeZone": "[parameters('timeZone')]"
+                            }
+                        }
+                    },
+                    "actions": {
+                        "Start_Container": {
+                            "type": "Http",
+                            "runAfter": {},
+                            "inputs": {
+                                "method": "POST",
+                                "uri": "[concat('https://management.azure.com', variables('containerGroupId'), '/start?api-version=2021-09-01')]",
+                                "authentication": {
+                                    "type": "ManagedServiceIdentity"
+                                }
+                            }
+                        },
+                        "Wait_For_Completion": {
+                            "type": "Until",
+                            "runAfter": {
+                                "Start_Container": ["Succeeded"]
+                            },
+                            "expression": "@or(equals(body('Get_Container_Status')?['properties']?['instanceView']?['state'], 'Succeeded'), equals(body('Get_Container_Status')?['properties']?['instanceView']?['state'], 'Failed'))",
+                            "limit": {
+                                "count": 360,
+                                "timeout": "PT6H"
+                            },
+                            "actions": {
+                                "Get_Container_Status": {
+                                    "type": "Http",
+                                    "inputs": {
+                                        "method": "GET",
+                                        "uri": "[concat('https://management.azure.com', variables('containerGroupId'), '?api-version=2021-09-01')]",
+                                        "authentication": {
+                                            "type": "ManagedServiceIdentity"
+                                        }
+                                    }
+                                },
+                                "Delay": {
+                                    "type": "Wait",
+                                    "runAfter": {
+                                        "Get_Container_Status": ["Succeeded"]
+                                    },
+                                    "inputs": {
+                                        "interval": {
+                                            "count": 1,
+                                            "unit": "Minute"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "Check_Final_Status": {
+                            "type": "If",
+                            "runAfter": {
+                                "Wait_For_Completion": ["Succeeded"]
+                            },
+                            "expression": {
+                                "and": [
+                                    {
+                                        "equals": [
+                                            "@body('Get_Container_Status')?['properties']?['instanceView']?['state']",
+                                            "Succeeded"
+                                        ]
+                                    }
+                                ]
+                            },
+                            "actions": {
+                                "Success_Response": {
+                                    "type": "Compose",
+                                    "inputs": {
+                                        "status": "Success",
+                                        "message": "FB Nova sync completed successfully",
+                                        "timestamp": "@utcNow()"
+                                    }
+                                }
+                            },
+                            "else": {
+                                "actions": {
+                                    "Failure_Response": {
+                                        "type": "Compose",
+                                        "inputs": {
+                                            "status": "Failed",
+                                            "message": "FB Nova sync failed - check container logs",
+                                            "timestamp": "@utcNow()"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "outputs": {}
+                }
+            }
+        }
+    ],
+    "outputs": {
+        "logicAppPrincipalId": {
+            "type": "string",
+            "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.principalId]"
+        },
+        "roleAssignmentCommand": {
+            "type": "string",
+            "value": "[concat('az role assignment create --assignee ', reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.principalId, ' --role Contributor --scope ', variables('containerGroupId'))]"
+        }
+    }
+}
+
