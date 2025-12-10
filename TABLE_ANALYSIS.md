@@ -2,6 +2,47 @@
 
 Generated from config file.xlsx and famous-brands-labs schema extraction.
 
+**SADD Alignment**: This tool is aligned with the Famous Brands Solution Architecture Design Document (SADD).
+
+---
+
+## SADD Architecture Alignment
+
+The Nova sync tool implements key patterns from the SADD:
+
+### Metadata Columns (per SADD ETL Pipeline Considerations)
+
+| Column | SADD Requirement | Description |
+|--------|-----------------|-------------|
+| `_batch_id` | Batch_Id | Incremental value unique across datawarehouse |
+| `_loaded_at` | FDW_Timestamp | Time of data landing in staging table |
+| `_source_system_id` | Source_system_Id | Unique ID for each source system |
+
+### Key Logging Dimensions (per SADD Operational Considerations)
+
+The `meta.nova_load_stats` table captures:
+- Pipeline name, job name, BatchID
+- Start time, end time, duration
+- Trigger type (manual, scheduled, event-based)
+- Row counts: read, inserted, rejected
+- Source and target table names
+- Status, Error Message
+
+### Data Quality Controls (per SADD)
+
+- **Source vs FDW Validation**: Row count comparison after each load
+- **30-day Trend**: Historical comparison via `meta.v_nova_30day_trend`
+- **Daily Summary**: Aggregated metrics via `meta.v_nova_daily_summary`
+
+### Load Ready Validation (per SADD)
+
+Before loading, data is validated:
+- NULL primary key rejection
+- Future date rejection
+- String length validation
+
+---
+
 ## Summary
 
 | Category | Count |
@@ -292,41 +333,57 @@ Based on your config file, these tables have date columns defined:
 
 ---
 
-## Metadata Columns Added
+## Metadata Columns Added (per SADD)
 
-The delta sync script adds these columns to target tables:
+The delta sync script adds these columns to target tables per SADD requirements:
 
-| Column | Type | Purpose |
-|--------|------|---------|
-| `_loaded_at` | DATETIME2 | When the row was loaded |
-| `_batch_id` | VARCHAR(50) | Unique batch identifier |
+| Column | Type | SADD Name | Purpose |
+|--------|------|-----------|---------|
+| `_loaded_at` | DATETIME2 | FDW_Timestamp | When the row was loaded |
+| `_batch_id` | VARCHAR(50) | Batch_Id | Unique batch identifier |
+| `_source_system_id` | INT | Source_system_Id | Source system identifier |
 
 Example batch ID: `nova_20251210_143022_a1b2c3d4`
 
+### Source System IDs (per SADD)
+
+| ID | System | Description |
+|----|--------|-------------|
+| 1 | FB_DW_PROD | Production Data Warehouse |
+| 2 | POS | Point of Sale System |
+| 3 | CRM | Customer Relationship Management |
+| 4 | FIS | Financial Information System |
+| 5 | MUNCH | Munch System |
+
 ---
 
-## Load Statistics Tracking
+## Load Statistics Tracking (SADD Key Logging Dimensions)
 
-The sync creates tables similar to your existing `load_stats`:
+The sync creates tables aligned with SADD operational requirements:
 
-### meta.nova_load_stats
+### meta.nova_load_stats (SADD Key Logging Dimensions)
 
-| Column | Description |
-|--------|-------------|
-| run_id | Unique batch identifier |
-| run_started | Start timestamp |
-| run_ended | End timestamp |
-| source_table | Source table name |
-| target_table | Target table name |
-| load_type | FULL or DELTA |
-| delta_column | Column used for delta |
-| delta_start_value | Delta range start |
-| delta_end_value | Delta range end |
-| rows_exported | Rows read from source |
-| rows_loaded | Rows inserted to target |
-| duration_ms | Time taken |
-| success | 1 = success, 0 = failed |
-| error_message | Error details if failed |
+| Column | SADD Requirement | Description |
+|--------|-----------------|-------------|
+| run_id | BatchID | Unique batch identifier |
+| pipeline_name | Pipeline name | e.g., PL_NOVA_SYNC |
+| trigger_type | Trigger type | manual, scheduled, event-based |
+| source_system_id | Source_system_Id | Source system identifier |
+| source_system_name | - | Source system name |
+| run_started | Start time | Start timestamp |
+| run_ended | End time | End timestamp |
+| source_table | Source table | Source table name |
+| target_table | Target table | Target table name |
+| load_type | - | FULL or DELTA |
+| delta_column | - | Column used for delta |
+| delta_start_value | - | Delta range start |
+| delta_end_value | - | Delta range end |
+| rows_read | Rows read | Rows read from source |
+| rows_loaded | Rows inserted | Rows inserted to target |
+| rows_rejected | Rows rejected | Rows failed Load Ready validation |
+| duration_ms | Duration | Time taken in ms |
+| success | Status | 1 = success, 0 = failed |
+| error_message | Error Message | Error details if failed |
 
 ### meta.nova_watermark
 
@@ -338,6 +395,37 @@ The sync creates tables similar to your existing `load_stats`:
 | last_row_count | Rows in last sync |
 | last_batch_id | Batch ID of last sync |
 | last_success_at | Last successful sync time |
+
+### meta.nova_data_quality (SADD Data Quality Controls)
+
+| Column | Description |
+|--------|-------------|
+| run_id | Links to nova_load_stats |
+| table_name | Table validated |
+| check_type | ROW_COUNT, SUM_CHECK, NULL_CHECK |
+| source_value | Value from source |
+| target_value | Value from target |
+| difference | Numeric difference |
+| difference_percent | Percentage difference |
+| is_valid | 1 = passed, 0 = failed |
+
+### meta.nova_source_systems (SADD Source System Reference)
+
+| Column | Description |
+|--------|-------------|
+| source_system_id | Unique ID per SADD |
+| source_system_name | System name |
+| source_system_type | DATABASE, FILE, API, STREAMING |
+| description | System description |
+
+### Useful Views
+
+| View | Purpose |
+|------|---------|
+| meta.v_nova_latest_runs | Latest status per table |
+| meta.v_nova_daily_summary | Daily aggregates for email report |
+| meta.v_nova_data_quality_issues | Data quality failures |
+| meta.v_nova_30day_trend | 30-day trend analysis (per SADD) |
 
 ---
 

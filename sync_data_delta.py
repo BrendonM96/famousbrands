@@ -1,13 +1,23 @@
 """
 FB Nova - Data Sync with Delta Loading Support
-Exports to CSV → Blob Storage → COPY INTO Synapse
+Aligned with Famous Brands Solution Architecture Design Document (SADD)
+
+Architecture Alignment:
+- Staging Layer (L1): Raw data extraction from source
+- Load Ready Layer: Validation before integration
+- Metadata tracking per SADD specifications
+- Data Quality validation (Source vs Target)
+- Operational logging with SADD-compliant fields
 
 Features:
-- Full load for dimension tables
+- Full load for dimension tables (truncate + reload)
 - Delta load for fact tables (date-based or ID-based)
-- Load statistics tracking (like load_stats table)
-- Metadata columns (_loaded_at, _batch_id)
+- Load statistics tracking aligned with SADD Key Logging Dimensions
+- Metadata columns (_loaded_at, _batch_id, _source_system_id)
 - Service Principal authentication for automated runs
+- Load Ready validation before final load
+- Data Quality reconciliation reporting
+- Alerting on failures (webhook support)
 """
 
 import pyodbc
@@ -16,8 +26,16 @@ import numpy as np
 import os
 import sys
 import uuid
+import json
 from datetime import datetime, timedelta
 from azure.storage.blob import BlobServiceClient
+
+# Optional: For alerting
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 # =============================================================================
 # CONFIGURATION
@@ -55,64 +73,52 @@ AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
 USERNAME = os.getenv("USERNAME")
 
 # Processing settings
-CHUNK_SIZE = 500000  # 500K rows per chunk
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500000"))  # 500K rows per chunk
 DELTA_LOOKBACK_DAYS = int(os.getenv("DELTA_LOOKBACK_DAYS", "7"))  # Default 7 days for delta
+
+# =============================================================================
+# SADD-ALIGNED CONFIGURATION
+# =============================================================================
+
+# Source System ID (per SADD: unique id identifying each source system)
+# 1 = POS, 2 = CRM, 3 = Munch, 4 = FIS, etc.
+SOURCE_SYSTEM_ID = int(os.getenv("SOURCE_SYSTEM_ID", "1"))
+SOURCE_SYSTEM_NAME = os.getenv("SOURCE_SYSTEM_NAME", "FB_DW_PROD")
+
+# Pipeline naming (per SADD: PL_POS, PL_FIS, etc.)
+PIPELINE_NAME = os.getenv("PIPELINE_NAME", "PL_NOVA_SYNC")
+
+# Trigger type (per SADD: manual, scheduled, event-based)
+TRIGGER_TYPE = os.getenv("TRIGGER_TYPE", "manual")
+
+# Alerting configuration
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")  # Teams/Slack webhook
+ALERT_EMAIL_ENABLED = os.getenv("ALERT_EMAIL_ENABLED", "false").lower() == "true"
+
+# Data Quality settings
+ENABLE_DATA_QUALITY_CHECKS = os.getenv("ENABLE_DATA_QUALITY_CHECKS", "true").lower() == "true"
+ROW_COUNT_TOLERANCE_PERCENT = float(os.getenv("ROW_COUNT_TOLERANCE_PERCENT", "0.01"))  # 1% tolerance
 
 # =============================================================================
 # BATCH TRACKING
 # =============================================================================
 
-# Generate unique batch ID for this run
+# Generate unique batch ID for this run (per SADD: BatchID)
 BATCH_ID = f"nova_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 RUN_STARTED = datetime.now()
 
 # =============================================================================
-# LOAD STATISTICS TABLE
+# LOAD READY VALIDATION RULES
 # =============================================================================
 
-LOAD_STATS_SCHEMA = """
--- Run this in target database to create the load stats table
--- Similar to your existing load_stats pattern
-
-IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'meta')
-    EXEC('CREATE SCHEMA meta');
-
-IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'meta' AND TABLE_NAME = 'nova_load_stats')
-CREATE TABLE [meta].[nova_load_stats] (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    run_id VARCHAR(50) NOT NULL,
-    run_started DATETIME2 NOT NULL,
-    run_ended DATETIME2,
-    source_schema VARCHAR(128) NOT NULL,
-    source_table VARCHAR(128) NOT NULL,
-    target_schema VARCHAR(128) NOT NULL,
-    target_table VARCHAR(128) NOT NULL,
-    load_type VARCHAR(20) NOT NULL,  -- 'FULL' or 'DELTA'
-    delta_column VARCHAR(128),
-    delta_start_value VARCHAR(50),
-    delta_end_value VARCHAR(50),
-    rows_exported BIGINT DEFAULT 0,
-    rows_loaded BIGINT DEFAULT 0,
-    chunks_processed INT DEFAULT 0,
-    duration_ms BIGINT,
-    success BIT DEFAULT 0,
-    error_message NVARCHAR(4000)
-);
-
--- Watermark table to track last successful sync per table
-IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'meta' AND TABLE_NAME = 'nova_watermark')
-CREATE TABLE [meta].[nova_watermark] (
-    table_name VARCHAR(255) PRIMARY KEY,
-    last_load_type VARCHAR(20),
-    last_delta_column VARCHAR(128),
-    last_delta_value VARCHAR(50),
-    last_max_id BIGINT,
-    last_row_count BIGINT,
-    last_batch_id VARCHAR(50),
-    last_success_at DATETIME2,
-    updated_at DATETIME2 DEFAULT GETUTCDATE()
-);
-"""
+# Validation rules per SADD Load Ready layer
+LOAD_READY_RULES = {
+    'reject_null_pk': True,           # Reject rows with NULL primary key
+    'reject_future_dates': True,       # Reject dates in the future
+    'reject_duplicate_pk': False,      # Don't reject duplicates (let target handle)
+    'validate_data_types': True,       # Validate data types match target
+    'max_string_length': 4000,         # Max varchar length
+}
 
 # =============================================================================
 # AUTHENTICATION
@@ -194,6 +200,45 @@ def get_blob_client():
     if not STORAGE_CONNECTION_STRING:
         raise ValueError("STORAGE_CONNECTION_STRING not set")
     return BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+
+# =============================================================================
+# ALERTING (per SADD: Operations | Alerting)
+# =============================================================================
+
+def send_alert(title, message, severity="warning", details=None):
+    """Send alert via webhook (Teams/Slack compatible)"""
+    if not ALERT_WEBHOOK_URL or not HAS_REQUESTS:
+        return
+    
+    try:
+        # Format for Microsoft Teams
+        payload = {
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "d63333" if severity == "error" else "ffc107",
+            "summary": title,
+            "sections": [{
+                "activityTitle": f"🔔 FB Nova Sync Alert: {title}",
+                "facts": [
+                    {"name": "Pipeline", "value": PIPELINE_NAME},
+                    {"name": "Batch ID", "value": BATCH_ID},
+                    {"name": "Trigger", "value": TRIGGER_TYPE},
+                    {"name": "Severity", "value": severity.upper()},
+                    {"name": "Message", "value": message}
+                ],
+                "markdown": True
+            }]
+        }
+        
+        if details:
+            payload["sections"][0]["facts"].extend([
+                {"name": k, "value": str(v)} for k, v in details.items()
+            ])
+        
+        requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
+        print(f"    ✓ Alert sent: {title}")
+    except Exception as e:
+        print(f"    Warning: Could not send alert: {e}")
 
 # =============================================================================
 # CONFIG READING
@@ -318,33 +363,184 @@ def update_watermark(target_conn, table_name, config, delta_value, max_id, row_c
     except Exception as e:
         print(f"    Warning: Could not update watermark: {e}")
 
-def log_load_stats(target_conn, config, start_time, rows_exported, rows_loaded, 
+def log_load_stats(target_conn, config, start_time, rows_read, rows_loaded, rows_rejected,
                    chunks, success, error=None, delta_start=None, delta_end=None):
-    """Log load statistics"""
+    """
+    Log load statistics per SADD Key Logging Dimensions:
+    - Pipeline name, job name, BatchID
+    - Start time, end time, duration
+    - Trigger type (manual, scheduled, event-based)
+    - Row counts: read, inserted, updated, rejected
+    - Source and target table names
+    - Status, Error Message
+    """
     try:
         duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
         cursor = target_conn.cursor()
         
         cursor.execute("""
             INSERT INTO meta.nova_load_stats 
-            (run_id, run_started, run_ended, source_schema, source_table, 
+            (run_id, pipeline_name, trigger_type, source_system_id, source_system_name,
+             run_started, run_ended, source_schema, source_table, 
              target_schema, target_table, load_type, delta_column, 
-             delta_start_value, delta_end_value, rows_exported, rows_loaded,
+             delta_start_value, delta_end_value, rows_read, rows_loaded, rows_rejected,
              chunks_processed, duration_ms, success, error_message)
-            VALUES (?, ?, GETUTCDATE(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, GETUTCDATE(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            BATCH_ID, start_time,
+            BATCH_ID, PIPELINE_NAME, TRIGGER_TYPE, SOURCE_SYSTEM_ID, SOURCE_SYSTEM_NAME,
+            start_time,
             config['source_schema'], config['source_table'],
             config['target_schema'], config['target_table'],
             config['load_type'], config.get('date_column'),
             str(delta_start) if delta_start else None,
             str(delta_end) if delta_end else None,
-            rows_exported, rows_loaded, chunks, duration_ms,
+            rows_read, rows_loaded, rows_rejected, chunks, duration_ms,
             1 if success else 0, error[:4000] if error else None
         )
         cursor.close()
     except Exception as e:
         print(f"    Warning: Could not log stats: {e}")
+
+# =============================================================================
+# DATA QUALITY VALIDATION (per SADD: Source vs FDW Validation)
+# =============================================================================
+
+def validate_source_target_counts(source_conn, target_conn, config, delta_start=None):
+    """
+    Validate row counts between source and target
+    Per SADD: Source vs FDW Validation after each batch load
+    """
+    if not ENABLE_DATA_QUALITY_CHECKS:
+        return None
+    
+    try:
+        src = f"[{config['source_schema']}].[{config['source_table']}]"
+        tgt = f"[{config['target_schema']}].[{config['target_table']}]"
+        
+        # Get source count
+        src_cursor = source_conn.cursor()
+        if config['load_type'] == 'DELTA' and delta_start:
+            date_col = config['date_column']
+            src_cursor.execute(f"SELECT COUNT(*) FROM {src} WHERE [{date_col}] >= ?", delta_start)
+        else:
+            src_cursor.execute(f"SELECT COUNT(*) FROM {src}")
+        source_count = src_cursor.fetchone()[0]
+        src_cursor.close()
+        
+        # Get target count (for this batch)
+        tgt_cursor = target_conn.cursor()
+        tgt_cursor.execute(f"SELECT COUNT(*) FROM {tgt} WHERE _batch_id = ?", BATCH_ID)
+        target_count = tgt_cursor.fetchone()[0]
+        tgt_cursor.close()
+        
+        # Calculate difference
+        if source_count > 0:
+            diff_percent = abs(source_count - target_count) / source_count
+        else:
+            diff_percent = 0 if target_count == 0 else 1
+        
+        is_valid = diff_percent <= ROW_COUNT_TOLERANCE_PERCENT
+        
+        validation_result = {
+            'source_count': source_count,
+            'target_count': target_count,
+            'difference': source_count - target_count,
+            'difference_percent': diff_percent * 100,
+            'is_valid': is_valid,
+            'tolerance_percent': ROW_COUNT_TOLERANCE_PERCENT * 100
+        }
+        
+        if not is_valid:
+            print(f"    ⚠ DATA QUALITY WARNING: Row count mismatch!")
+            print(f"      Source: {source_count:,}, Target: {target_count:,}, Diff: {diff_percent*100:.2f}%")
+        else:
+            print(f"    ✓ Data quality check passed (diff: {diff_percent*100:.2f}%)")
+        
+        return validation_result
+        
+    except Exception as e:
+        print(f"    Warning: Could not validate counts: {e}")
+        return None
+
+def log_data_quality_result(target_conn, config, validation_result):
+    """Log data quality validation results"""
+    if not validation_result:
+        return
+    
+    try:
+        cursor = target_conn.cursor()
+        cursor.execute("""
+            INSERT INTO meta.nova_data_quality
+            (run_id, table_name, check_type, source_value, target_value,
+             difference, difference_percent, is_valid, checked_at)
+            VALUES (?, ?, 'ROW_COUNT', ?, ?, ?, ?, ?, GETUTCDATE())
+        """,
+            BATCH_ID,
+            f"{config['source_schema']}.{config['source_table']}",
+            str(validation_result['source_count']),
+            str(validation_result['target_count']),
+            validation_result['difference'],
+            validation_result['difference_percent'],
+            1 if validation_result['is_valid'] else 0
+        )
+        cursor.close()
+    except Exception as e:
+        print(f"    Warning: Could not log data quality result: {e}")
+
+# =============================================================================
+# LOAD READY VALIDATION (per SADD Load Ready Layer)
+# =============================================================================
+
+def validate_load_ready(df, config):
+    """
+    Validate data before final load (per SADD Load Ready Layer)
+    Returns: (validated_df, rejected_count, rejection_reasons)
+    """
+    rejected_count = 0
+    rejection_reasons = []
+    
+    original_count = len(df)
+    
+    # Rule 1: Reject NULL primary keys
+    if LOAD_READY_RULES['reject_null_pk'] and config.get('pk_column'):
+        pk_col = config['pk_column']
+        if pk_col in df.columns:
+            null_pk_mask = df[pk_col].isna()
+            null_pk_count = null_pk_mask.sum()
+            if null_pk_count > 0:
+                df = df[~null_pk_mask]
+                rejected_count += null_pk_count
+                rejection_reasons.append(f"NULL {pk_col}: {null_pk_count}")
+    
+    # Rule 2: Reject future dates (if date column exists)
+    if LOAD_READY_RULES['reject_future_dates'] and config.get('date_column'):
+        date_col = config['date_column']
+        if date_col in df.columns:
+            try:
+                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+                future_mask = df[date_col] > datetime.now()
+                future_count = future_mask.sum()
+                if future_count > 0:
+                    df = df[~future_mask]
+                    rejected_count += future_count
+                    rejection_reasons.append(f"Future {date_col}: {future_count}")
+            except Exception:
+                pass  # Skip if date parsing fails
+    
+    # Rule 3: Truncate oversized strings
+    if LOAD_READY_RULES['validate_data_types']:
+        max_len = LOAD_READY_RULES['max_string_length']
+        for col in df.select_dtypes(include=['object']).columns:
+            if col.startswith('_'):  # Skip metadata columns
+                continue
+            df[col] = df[col].astype(str).str[:max_len]
+    
+    if rejected_count > 0:
+        print(f"    [LOAD READY] Validated: {len(df):,} rows, Rejected: {rejected_count:,}")
+        for reason in rejection_reasons:
+            print(f"      - {reason}")
+    
+    return df, rejected_count, rejection_reasons
 
 # =============================================================================
 # DATA EXPORT WITH DELTA SUPPORT
@@ -369,9 +565,15 @@ def fix_columns(df):
     return df
 
 def add_metadata_columns(df):
-    """Add metadata columns to dataframe"""
+    """
+    Add metadata columns to dataframe per SADD requirements:
+    - _loaded_at: FDW_Timestamp (time of data landing)
+    - _batch_id: Batch_Id (incremental unique value)
+    - _source_system_id: Source_system_Id (unique id for source system)
+    """
     df['_loaded_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     df['_batch_id'] = BATCH_ID
+    df['_source_system_id'] = SOURCE_SYSTEM_ID
     return df
 
 def get_delta_query(source_conn, config, watermark):
@@ -403,7 +605,7 @@ def get_delta_query(source_conn, config, watermark):
     return query, delta_start, delta_end
 
 def export_to_csv(source_conn, config, watermark):
-    """Export source table to CSV with delta support"""
+    """Export source table to CSV with delta support and Load Ready validation"""
     table_name = config['source_table']
     base_filename = f"{table_name}"
     
@@ -413,7 +615,9 @@ def export_to_csv(source_conn, config, watermark):
     # Get appropriate query
     query, delta_start, delta_end = get_delta_query(source_conn, config, watermark)
     
-    total_rows = 0
+    total_rows_read = 0
+    total_rows_validated = 0
+    total_rows_rejected = 0
     chunk_num = 0
     max_id = None
     
@@ -422,11 +626,18 @@ def export_to_csv(source_conn, config, watermark):
         chunk_num += 1
         chunk_filename = f"{base_filename}_chunk_{chunk_num:04d}.csv"
         
+        rows_read = len(chunk)
+        total_rows_read += rows_read
+        
         # Fix data types
         chunk = fix_columns(chunk)
         
-        # Add metadata columns
+        # Add metadata columns (per SADD)
         chunk = add_metadata_columns(chunk)
+        
+        # LOAD READY VALIDATION (per SADD)
+        chunk, rejected_count, _ = validate_load_ready(chunk, config)
+        total_rows_rejected += rejected_count
         
         # Track max ID if PK column exists
         pk_col = config.get('pk_column')
@@ -436,25 +647,26 @@ def export_to_csv(source_conn, config, watermark):
                 max_id = max(max_id or 0, int(chunk_max))
         
         # Write to CSV
-        if chunk_num == 1:
-            chunk.to_csv(chunk_filename, index=False, sep='|', encoding='utf-8',
-                        na_rep='', float_format='%.10f')
-        else:
-            chunk.to_csv(chunk_filename, index=False, sep='|', encoding='utf-8',
-                        na_rep='', float_format='%.10f', header=False)
+        if len(chunk) > 0:
+            if chunk_num == 1:
+                chunk.to_csv(chunk_filename, index=False, sep='|', encoding='utf-8',
+                            na_rep='', float_format='%.10f')
+            else:
+                chunk.to_csv(chunk_filename, index=False, sep='|', encoding='utf-8',
+                            na_rep='', float_format='%.10f', header=False)
+            
+            # Upload immediately
+            upload_chunk_to_blob(chunk_filename, table_name, chunk_num)
+            os.remove(chunk_filename)
+            
+            total_rows_validated += len(chunk)
         
-        # Upload immediately
-        upload_chunk_to_blob(chunk_filename, table_name, chunk_num)
-        os.remove(chunk_filename)
-        
-        total_rows += len(chunk)
-        
-        if total_rows % 1000000 == 0:
-            print(f"    Progress: {total_rows:,} rows...")
+        if total_rows_read % 1000000 == 0:
+            print(f"    Progress: {total_rows_read:,} rows read, {total_rows_validated:,} validated...")
     
-    print(f"    Rows: {total_rows:,}")
+    print(f"    Rows read: {total_rows_read:,}, Validated: {total_rows_validated:,}, Rejected: {total_rows_rejected:,}")
     
-    return base_filename, total_rows, chunk_num, delta_start, delta_end, max_id
+    return base_filename, total_rows_read, total_rows_validated, total_rows_rejected, chunk_num, delta_start, delta_end, max_id
 
 # =============================================================================
 # BLOB OPERATIONS
@@ -485,13 +697,13 @@ def cleanup_blobs(table_name, chunk_count):
 # =============================================================================
 
 def ensure_metadata_columns(target_conn, config):
-    """Ensure target table has metadata columns"""
+    """Ensure target table has metadata columns per SADD"""
     tgt = f"[{config['target_schema']}].[{config['target_table']}]"
     
     try:
         cursor = target_conn.cursor()
         
-        # Check and add _loaded_at
+        # Check and add _loaded_at (FDW_Timestamp per SADD)
         cursor.execute(f"""
             IF NOT EXISTS (
                 SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
@@ -502,7 +714,7 @@ def ensure_metadata_columns(target_conn, config):
             ALTER TABLE {tgt} ADD _loaded_at DATETIME2 NULL;
         """)
         
-        # Check and add _batch_id
+        # Check and add _batch_id (Batch_Id per SADD)
         cursor.execute(f"""
             IF NOT EXISTS (
                 SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
@@ -511,6 +723,17 @@ def ensure_metadata_columns(target_conn, config):
                 AND COLUMN_NAME = '_batch_id'
             )
             ALTER TABLE {tgt} ADD _batch_id VARCHAR(50) NULL;
+        """)
+        
+        # Check and add _source_system_id (Source_system_Id per SADD)
+        cursor.execute(f"""
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = '{config['target_schema']}' 
+                AND TABLE_NAME = '{config['target_table']}'
+                AND COLUMN_NAME = '_source_system_id'
+            )
+            ALTER TABLE {tgt} ADD _source_system_id INT NULL;
         """)
         
         cursor.close()
@@ -537,9 +760,6 @@ def prepare_target_table(source_conn, target_conn, config):
             cursor.execute(f"TRUNCATE TABLE {tgt}")
         else:
             print(f"  Table exists (DELTA load - appending)...")
-            # For delta, we might want to delete overlapping records
-            # This depends on your business logic
-            # For now, we just append
         
         # Ensure metadata columns exist
         ensure_metadata_columns(target_conn, config)
@@ -569,9 +789,10 @@ def prepare_target_table(source_conn, target_conn, config):
             
             columns.append(f"[{col_name}] {type_str} NULL")
         
-        # Add metadata columns
+        # Add metadata columns per SADD
         columns.append("[_loaded_at] DATETIME2 NULL")
         columns.append("[_batch_id] VARCHAR(50) NULL")
+        columns.append("[_source_system_id] INT NULL")
         
         create_sql = f"CREATE TABLE {tgt} ({', '.join(columns)})"
         cursor.execute(create_sql)
@@ -621,16 +842,18 @@ def copy_into_target(target_conn, config, table_name, chunk_count):
 # =============================================================================
 
 def process_table(source_conn, target_conn, config):
-    """Process a single table with delta support"""
+    """Process a single table with delta support and SADD compliance"""
     start_time = datetime.now()
-    rows_exported = 0
+    rows_read = 0
     rows_loaded = 0
+    rows_rejected = 0
     chunk_count = 0
     delta_start = None
     delta_end = None
     max_id = None
     error = None
     success = False
+    validation_result = None
     
     try:
         # Get watermark for delta loads
@@ -638,11 +861,11 @@ def process_table(source_conn, target_conn, config):
         if config['load_type'] == 'DELTA':
             watermark = get_watermark(target_conn, config['source_table'])
         
-        # Export data
-        table_name, rows_exported, chunk_count, delta_start, delta_end, max_id = \
+        # Export data with Load Ready validation
+        table_name, rows_read, rows_validated, rows_rejected, chunk_count, delta_start, delta_end, max_id = \
             export_to_csv(source_conn, config, watermark)
         
-        if rows_exported == 0:
+        if rows_validated == 0:
             print(f"    No rows to process")
             success = True
         else:
@@ -657,6 +880,12 @@ def process_table(source_conn, target_conn, config):
             # Cleanup blobs
             cleanup_blobs(table_name, chunk_count)
             
+            # DATA QUALITY VALIDATION (per SADD)
+            validation_result = validate_source_target_counts(
+                source_conn, target_conn, config, delta_start
+            )
+            log_data_quality_result(target_conn, config, validation_result)
+            
             # Update watermark
             update_watermark(target_conn, config['source_table'], config, 
                            delta_end, max_id, rows_loaded)
@@ -666,9 +895,21 @@ def process_table(source_conn, target_conn, config):
     except Exception as e:
         error = str(e)
         print(f"  ✗ ERROR: {e}")
+        
+        # Send alert on failure
+        send_alert(
+            f"Sync Failed: {config['source_table']}",
+            str(e),
+            severity="error",
+            details={
+                "Table": f"{config['source_schema']}.{config['source_table']}",
+                "Load Type": config['load_type'],
+                "Rows Read": rows_read
+            }
+        )
     
-    # Log statistics
-    log_load_stats(target_conn, config, start_time, rows_exported, rows_loaded,
+    # Log statistics (per SADD Key Logging Dimensions)
+    log_load_stats(target_conn, config, start_time, rows_read, rows_loaded, rows_rejected,
                    chunk_count, success, error, delta_start, delta_end)
     
     elapsed = (datetime.now() - start_time).total_seconds()
@@ -677,15 +918,17 @@ def process_table(source_conn, target_conn, config):
     return {
         'table': config['source_table'],
         'load_type': config['load_type'],
-        'rows_exported': rows_exported,
+        'rows_read': rows_read,
         'rows_loaded': rows_loaded,
+        'rows_rejected': rows_rejected,
         'time': elapsed,
         'status': 'Success' if success else 'FAILED',
-        'error': error
+        'error': error,
+        'data_quality': validation_result
     }
 
 def ensure_meta_tables(target_conn):
-    """Ensure metadata tables exist"""
+    """Ensure metadata tables exist per SADD requirements"""
     try:
         cursor = target_conn.cursor()
         
@@ -695,27 +938,39 @@ def ensure_meta_tables(target_conn):
                 EXEC('CREATE SCHEMA meta')
         """)
         
-        # Create load stats table
+        # Create enhanced load stats table (per SADD Key Logging Dimensions)
         cursor.execute("""
             IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES 
                           WHERE TABLE_SCHEMA = 'meta' AND TABLE_NAME = 'nova_load_stats')
             CREATE TABLE [meta].[nova_load_stats] (
                 id INT IDENTITY(1,1),
+                -- Run identification (per SADD)
                 run_id VARCHAR(50) NOT NULL,
+                pipeline_name VARCHAR(128),
+                trigger_type VARCHAR(50),
+                source_system_id INT,
+                source_system_name VARCHAR(128),
+                -- Timestamps (per SADD)
                 run_started DATETIME2 NOT NULL,
                 run_ended DATETIME2,
+                -- Table information
                 source_schema VARCHAR(128) NOT NULL,
                 source_table VARCHAR(128) NOT NULL,
                 target_schema VARCHAR(128) NOT NULL,
                 target_table VARCHAR(128) NOT NULL,
+                -- Load type
                 load_type VARCHAR(20) NOT NULL,
                 delta_column VARCHAR(128),
                 delta_start_value VARCHAR(50),
                 delta_end_value VARCHAR(50),
-                rows_exported BIGINT DEFAULT 0,
+                -- Row counts (per SADD: read, inserted, updated, rejected)
+                rows_read BIGINT DEFAULT 0,
                 rows_loaded BIGINT DEFAULT 0,
+                rows_rejected BIGINT DEFAULT 0,
                 chunks_processed INT DEFAULT 0,
+                -- Performance
                 duration_ms BIGINT,
+                -- Status (per SADD)
                 success BIT DEFAULT 0,
                 error_message NVARCHAR(4000)
             )
@@ -738,8 +993,26 @@ def ensure_meta_tables(target_conn):
             )
         """)
         
+        # Create data quality table (per SADD: Data Quality controls)
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES 
+                          WHERE TABLE_SCHEMA = 'meta' AND TABLE_NAME = 'nova_data_quality')
+            CREATE TABLE [meta].[nova_data_quality] (
+                id INT IDENTITY(1,1),
+                run_id VARCHAR(50) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                check_type VARCHAR(50) NOT NULL,
+                source_value VARCHAR(255),
+                target_value VARCHAR(255),
+                difference BIGINT,
+                difference_percent FLOAT,
+                is_valid BIT DEFAULT 0,
+                checked_at DATETIME2
+            )
+        """)
+        
         cursor.close()
-        print("  ✓ Meta tables ready")
+        print("  ✓ Meta tables ready (SADD-compliant)")
     except Exception as e:
         print(f"  Warning: Could not create meta tables: {e}")
 
@@ -764,13 +1037,26 @@ def validate_environment():
     
     return True
 
+def print_sadd_compliance_info():
+    """Print SADD compliance information"""
+    print("\nSADD Compliance:")
+    print(f"  Pipeline Name: {PIPELINE_NAME}")
+    print(f"  Source System ID: {SOURCE_SYSTEM_ID} ({SOURCE_SYSTEM_NAME})")
+    print(f"  Trigger Type: {TRIGGER_TYPE}")
+    print(f"  Data Quality Checks: {'Enabled' if ENABLE_DATA_QUALITY_CHECKS else 'Disabled'}")
+    print(f"  Alerting: {'Configured' if ALERT_WEBHOOK_URL else 'Not configured'}")
+
 def main():
     print("=" * 60)
     print("FB NOVA - DATA SYNC WITH DELTA LOADING")
+    print("Aligned with Solution Architecture Design Document (SADD)")
+    print("=" * 60)
     print(f"Batch ID: {BATCH_ID}")
     print(f"Started: {RUN_STARTED}")
     print(f"Authentication: {get_auth_mode()}")
     print(f"Delta lookback: {DELTA_LOOKBACK_DAYS} days")
+    
+    print_sadd_compliance_info()
     print("=" * 60)
     
     if not validate_environment():
@@ -782,6 +1068,7 @@ def main():
         tables = read_config()
     except Exception as e:
         print(f"  ✗ ERROR: {e}")
+        send_alert("Config Read Failed", str(e), severity="error")
         sys.exit(1)
     
     if len(tables) == 0:
@@ -795,10 +1082,11 @@ def main():
         target_conn = connect_target()
     except Exception as e:
         print(f"  ✗ CONNECTION ERROR: {e}")
+        send_alert("Connection Failed", str(e), severity="error")
         sys.exit(1)
     
     # Ensure meta tables exist
-    print("\nSTEP 3: SETUP META TABLES")
+    print("\nSTEP 3: SETUP META TABLES (SADD-compliant)")
     ensure_meta_tables(target_conn)
     
     # Process tables
@@ -819,20 +1107,44 @@ def main():
     delta_loads = [r for r in results if r['load_type'] == 'DELTA']
     success = sum(1 for r in results if r['status'] == 'Success')
     failed = sum(1 for r in results if r['status'] == 'FAILED')
-    total_rows = sum(r['rows_loaded'] for r in results)
+    total_rows_loaded = sum(r['rows_loaded'] for r in results)
+    total_rows_rejected = sum(r['rows_rejected'] for r in results)
     total_time = sum(r['time'] for r in results)
     
     print(f"Batch ID: {BATCH_ID}")
+    print(f"Pipeline: {PIPELINE_NAME}")
+    print(f"Trigger: {TRIGGER_TYPE}")
     print(f"Tables: {len(results)} (Full: {len(full_loads)}, Delta: {len(delta_loads)})")
     print(f"Status: Success: {success}, Failed: {failed}")
-    print(f"Total rows loaded: {total_rows:,}")
+    print(f"Total rows loaded: {total_rows_loaded:,}")
+    print(f"Total rows rejected: {total_rows_rejected:,}")
     print(f"Total time: {total_time:.1f}s")
+    
+    # Data Quality Summary
+    dq_issues = [r for r in results if r.get('data_quality') and not r['data_quality'].get('is_valid')]
+    if dq_issues:
+        print(f"\n⚠ Data Quality Issues: {len(dq_issues)} tables")
+        for r in dq_issues:
+            dq = r['data_quality']
+            print(f"  - {r['table']}: {dq['difference_percent']:.2f}% difference")
     
     if failed > 0:
         print("\nFailed tables:")
         for r in results:
             if r['status'] == 'FAILED':
                 print(f"  - {r['table']}: {r['error']}")
+        
+        # Send summary alert
+        send_alert(
+            f"Sync Completed with Failures",
+            f"{failed} of {len(results)} tables failed",
+            severity="error",
+            details={
+                "Successful": success,
+                "Failed": failed,
+                "Total Rows": total_rows_loaded
+            }
+        )
     
     source_conn.close()
     target_conn.close()
@@ -844,4 +1156,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

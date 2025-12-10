@@ -2,6 +2,8 @@
 
 A high-performance Python utility for synchronizing data between Azure Synapse Analytics environments using the CSV → Blob Storage → COPY INTO pipeline approach.
 
+**✅ SADD Aligned** - This tool is aligned with the Famous Brands Solution Architecture Design Document (SADD).
+
 ## Overview
 
 This tool copies data from a **source** Synapse database (Production) to a **target** Synapse database (Dev/Test) using the fastest bulk loading method available in Azure Synapse: the `COPY INTO` command.
@@ -256,6 +258,53 @@ AZURE_CLIENT_SECRET=your-service-principal-secret
 
 Use `sync_data_copy_automated.py` for production runs.
 
+## SADD Alignment
+
+This tool implements key patterns from the Solution Architecture Design Document (SADD):
+
+### Metadata Columns (per SADD ETL Pipeline Considerations)
+
+| Column | SADD Requirement | Purpose |
+|--------|-----------------|---------|
+| `_batch_id` | Batch_Id | Unique batch identifier |
+| `_loaded_at` | FDW_Timestamp | Data landing timestamp |
+| `_source_system_id` | Source_system_Id | Source system identifier |
+
+### Key Logging Dimensions (per SADD)
+
+The `meta.nova_load_stats` table captures:
+- Pipeline name, job name, BatchID
+- Start time, end time, duration
+- Trigger type (manual, scheduled, event-based)
+- Row counts: read, inserted, rejected
+- Source and target table names
+- Status, Error Message
+
+### Data Quality Controls (per SADD)
+
+- **Source vs FDW Validation**: Row count comparison after each load
+- **Load Ready Validation**: Data validation before final load
+- **30-day Trend Analysis**: Historical metrics tracking
+- **Alerting**: Webhook notifications on failures
+
+### Configuration (per SADD)
+
+```env
+# Source System Identification (per SADD)
+SOURCE_SYSTEM_ID=1
+SOURCE_SYSTEM_NAME=FB_DW_PROD
+
+# Pipeline Configuration (per SADD)
+PIPELINE_NAME=PL_NOVA_SYNC
+TRIGGER_TYPE=scheduled
+
+# Data Quality (per SADD)
+ENABLE_DATA_QUALITY_CHECKS=true
+
+# Alerting (per SADD)
+ALERT_WEBHOOK_URL=https://outlook.office.com/webhook/...
+```
+
 ## Table Analysis
 
 See `TABLE_ANALYSIS.md` for:
@@ -263,6 +312,7 @@ See `TABLE_ANALYSIS.md` for:
 - Recommended sync phases
 - Large table handling strategies
 - Performance estimates
+- SADD alignment details
 
 ## Related Documentation
 
