@@ -1,0 +1,6 @@
+# Required packages for FB Nova Synapse Data Sync
+pyodbc>=4.0.39
+pandas>=2.0.0
+numpy>=1.24.0
+azure-storage-blob>=12.19.0
+openpyxl>=3.1.0  # Required for reading Excel config file
