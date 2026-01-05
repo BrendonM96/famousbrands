@@ -70,8 +70,8 @@ TABLES = [
     {
         'name': 'FactSalesSummary',
         'pk': 'FactSalesSummaryID',
-        'numeric_cols': ['SalesAmount', 'TransactionCount'],
-        'not_null_cols': ['FactSalesSummaryID']
+        'numeric_cols': ['SummaryTransAmount', 'SummarySalesAmountExclVAT', 'SummaryDiscountAmount'],
+        'not_null_cols': ['FactSalesSummaryID', 'DimRestaurantID', 'DimBusinessDateID']
     }
 ]
 
